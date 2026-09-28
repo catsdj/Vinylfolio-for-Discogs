@@ -95,7 +95,9 @@ interface InvoiceAddLogContext {
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 const MATCHER_VERSION = 'deejay-progressive-2026-04-27-2';
 const EXCELLENT_MATCH_SCORE = 90;
-const DISCOGS_REQUEST_DELAY_MS = 7000;
+// Discogs allows 60 authenticated requests per minute. 1200ms matches the
+// collection sync spacer (about 50/minute). A 429 still backs off separately.
+const DISCOGS_REQUEST_DELAY_MS = 1200;
 const DISCOGS_429_BACKOFF_MS = 30000;
 const DISCOGS_REQUEST_TIMEOUT_MS = 30000;
 const DEEJAY_DEFAULT_MEDIA_CONDITION = 'Mint (M)';
