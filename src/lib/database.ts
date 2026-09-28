@@ -2,6 +2,8 @@ import Database from 'better-sqlite3';
 import fs from 'fs';
 import path from 'path';
 import { createTagTables } from './tags';
+import { createUnmatchedInvoiceTables } from './unmatchedInvoiceItems';
+import { backfillProcessedInvoices, createProcessedInvoiceTables } from './processedInvoices';
 
 const DB_PATH = path.join(process.cwd(), 'data', 'discogs_collection.db');
 
@@ -462,6 +464,17 @@ export class DiscogsDatabase {
       {
         id: '006_collection_tags',
         apply: () => createTagTables(this.db),
+      },
+      {
+        id: '007_unmatched_invoice_items',
+        apply: () => createUnmatchedInvoiceTables(this.db),
+      },
+      {
+        id: '008_processed_invoices',
+        apply: () => {
+          createProcessedInvoiceTables(this.db);
+          backfillProcessedInvoices(this.db);
+        },
       },
     ];
 

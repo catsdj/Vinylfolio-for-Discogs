@@ -11,6 +11,29 @@ import {
 } from '@/lib/invoiceImport';
 import { extractYouTubeVideoId } from '@/lib/urlValidation';
 import { secureFetch } from '@/lib/secureFetch';
+import {
+  classifyInvoiceLines,
+  compareUploadedInvoice,
+  completeProcessedInvoice,
+  findProcessedInvoice,
+  markProcessedInvoiceLineAdded,
+  mergeProcessedInvoiceLines,
+  recordInvoiceWithNoMatches,
+} from '@/lib/processedInvoices';
+import {
+  dismissUnmatchedInvoiceItem,
+  findCollectionRelease,
+  getOpenUnmatchedInvoiceItem,
+  listOpenUnmatchedInvoiceItems,
+  recordUnmatchedDiscogsMiss,
+  removeOpenUnmatchedInvoiceItem,
+  retryMissedReleaseSearch,
+  saveUnmatchedInvoiceLine,
+  shouldRecordUnmatchedMiss,
+  unmatchedInvoiceIdentity,
+  updateUnmatchedSearchQuery,
+  type UnmatchedInvoiceItem,
+} from '@/lib/unmatchedInvoiceItems';
 
 export const runtime = 'nodejs';
 
@@ -59,6 +82,7 @@ interface AddCollectionSelection {
   releaseId: number;
   folderId: number;
   invoiceItemLabel?: string;
+  itemId?: string;
 }
 
 interface AddCollectionRequest {
@@ -80,6 +104,8 @@ interface ImportSession {
   expiresAt: number;
   metadata: ImportSessionMetadata;
   searchResults: DiscogsSearchCache;
+  items: DeejayInvoiceItem[];
+  matchOutcomes: Map<string, 'matched' | 'no-match' | 'error'>;
 }
 
 interface InvoiceAddLogContext {
@@ -139,7 +165,7 @@ function cleanupImportSessions() {
   }
 }
 
-function createImportSession(metadata: ImportSessionMetadata): string {
+function createImportSession(metadata: ImportSessionMetadata, items: DeejayInvoiceItem[] = []): string {
   cleanupImportSessions();
   const importId = crypto.randomUUID();
   importSessions.set(importId, {
@@ -147,6 +173,8 @@ function createImportSession(metadata: ImportSessionMetadata): string {
     expiresAt: Date.now() + IMPORT_SESSION_TTL_MS,
     metadata,
     searchResults: new Map(),
+    items,
+    matchOutcomes: new Map(),
   });
   return importId;
 }
@@ -1028,6 +1056,9 @@ function parseAddSelections(
     const invoiceItemLabel = typeof rawSelection?.invoiceItemLabel === 'string'
       ? rawSelection.invoiceItemLabel.trim().slice(0, 240) || undefined
       : undefined;
+    const itemId = typeof rawSelection?.itemId === 'string' && rawSelection.itemId.trim()
+      ? rawSelection.itemId.trim()
+      : undefined;
 
     if (!Number.isInteger(releaseId) || releaseId <= 0) {
       continue;
@@ -1042,7 +1073,7 @@ function parseAddSelections(
     }
 
     seenReleaseIds.add(releaseId);
-    selections.push({ releaseId, folderId, invoiceItemLabel });
+    selections.push({ releaseId, folderId, invoiceItemLabel, itemId });
   }
 
   if (selections.length === 0) {
@@ -1056,9 +1087,11 @@ async function findCandidates(
   item: DeejayInvoiceItem,
   debugTrace?: string[],
   queryCache?: DiscogsSearchCache,
-): Promise<CandidateMatch[]> {
+): Promise<{ candidates: CandidateMatch[]; allSearchesFailed: boolean }> {
   const seenQueries = new Set<string>();
   const seenResults = new Map<number, DiscogsSearchResult>();
+  let searchAttempts = 0;
+  let searchFailures = 0;
 
   const queries: URLSearchParams[] = [];
   const catalogVariants = generateCatalogVariants(item.catalogNumber);
@@ -1110,6 +1143,7 @@ async function findCandidates(
 
     seenQueries.add(queryKey);
     debugTrace?.push(`${queryCache?.has(queryKey) ? 'cache-hit' : 'query'}:${queryKey}`);
+    searchAttempts += 1;
 
     try {
       const results = await searchDiscogs(query, queryCache);
@@ -1128,6 +1162,7 @@ async function findCandidates(
         break;
       }
     } catch (error) {
+      searchFailures += 1;
       console.error('Invoice Discogs search failed:', error);
     }
   }
@@ -1154,15 +1189,240 @@ async function findCandidates(
       (candidate.format.length === 0 || getFormatSignals(candidate.format).hasVinyl);
   });
 
-  return markCollectionPresence((relevantCandidates.length > 0 ? relevantCandidates : [])
-    .slice(0, 8))
-    .sort((left, right) => {
-      if (left.inCollection !== right.inCollection) {
-        return left.inCollection ? -1 : 1;
-      }
+  return {
+    candidates: markCollectionPresence((relevantCandidates.length > 0 ? relevantCandidates : [])
+      .slice(0, 8))
+      .sort((left, right) => {
+        if (left.inCollection !== right.inCollection) {
+          return left.inCollection ? -1 : 1;
+        }
 
-      return right.score - left.score;
+        return right.score - left.score;
+      }),
+    allSearchesFailed: searchAttempts > 0 && searchFailures === searchAttempts,
+  };
+}
+
+async function searchUnmatchedOnDiscogs(item: UnmatchedInvoiceItem, query: string): Promise<CandidateMatch[]> {
+  const results = await searchDiscogs(new URLSearchParams({
+    type: 'release',
+    q: query,
+    per_page: '10',
+  }));
+  const invoiceItem: DeejayInvoiceItem = {
+    id: String(item.id),
+    catalogNumber: item.catalogNumber,
+    artist: item.artist,
+    title: item.title,
+    unitPrice: item.unitPrice ?? 0,
+    quantity: item.quantity ?? 1,
+    totalPrice: (item.unitPrice ?? 0) * (item.quantity ?? 1),
+    rawDescription: item.rawDescription,
+  };
+  const candidates = results
+    .filter((result) => result.type === 'release')
+    .map((result) => scoreCandidate(invoiceItem, result))
+    .sort((left, right) => right.score - left.score)
+    .slice(0, 8);
+
+  return markCollectionPresence(candidates);
+}
+
+function unmatchedLineId(value: unknown): number | null {
+  const id = Number(value);
+  return Number.isInteger(id) && id > 0 ? id : null;
+}
+
+async function dismissUnmatchedLine(request: NextRequest) {
+  const body = await request.json() as { id?: unknown };
+  const id = unmatchedLineId(body.id);
+  if (!id) {
+    return NextResponse.json({ error: 'Unmatched invoice line is required' }, { status: 400 });
+  }
+
+  dismissUnmatchedInvoiceItem(getDatabase().getDb(), id);
+  return NextResponse.json({ success: true });
+}
+
+async function searchUnmatchedLine(request: NextRequest) {
+  const body = await request.json() as { id?: unknown; query?: unknown };
+  const id = unmatchedLineId(body.id);
+  if (!id) {
+    return NextResponse.json({ error: 'Unmatched invoice line is required' }, { status: 400 });
+  }
+
+  const db = getDatabase().getDb();
+  const item = getOpenUnmatchedInvoiceItem(db, id);
+  if (!item) {
+    return NextResponse.json({ error: 'That unmatched line is no longer open' }, { status: 404 });
+  }
+
+  const submitted = typeof body.query === 'string' ? body.query : item.searchQuery;
+  updateUnmatchedSearchQuery(db, id, submitted);
+  const stored = getOpenUnmatchedInvoiceItem(db, id);
+  const query = stored?.searchQuery.trim() || '';
+  if (!query) {
+    return NextResponse.json({ error: 'Enter a search query' }, { status: 400 });
+  }
+
+  try {
+    const result = await retryMissedReleaseSearch({
+      query,
+      now: new Date().toISOString(),
+      findInCollection: () => findCollectionRelease(db, item.artist, item.title),
+      searchDiscogs: (searchQuery) => searchUnmatchedOnDiscogs(item, searchQuery),
     });
+
+    if (result.outcome === 'not-found') {
+      recordUnmatchedDiscogsMiss(db, id, result.checkedAt);
+    }
+
+    if (result.outcome === 'candidates') {
+      const importId = createImportSession({
+        invoiceNumber: item.invoiceNumber,
+        invoiceDate: item.invoiceDate,
+        shippingPrice: null,
+      });
+      addCandidatesToImportSession(importId, result.candidates);
+      return NextResponse.json({ ...result, importId, searchQuery: query });
+    }
+
+    return NextResponse.json({ ...result, searchQuery: query });
+  } catch (error) {
+    console.error('Unmatched invoice Discogs search failed:', error);
+    return NextResponse.json({ error: 'Discogs search failed' }, { status: 500 });
+  }
+}
+
+async function addUnmatchedLine(request: NextRequest) {
+  const body = await request.json() as {
+    id?: unknown;
+    releaseId?: unknown;
+    folderId?: unknown;
+    importId?: unknown;
+  };
+  const id = unmatchedLineId(body.id);
+  const importId = typeof body.importId === 'string' ? body.importId : '';
+  if (!id || !importId) {
+    return NextResponse.json({ error: 'Unmatched invoice line is required' }, { status: 400 });
+  }
+
+  const db = getDatabase().getDb();
+  const item = getOpenUnmatchedInvoiceItem(db, id);
+  const session = getImportSession(importId);
+  if (!item || !session) {
+    return NextResponse.json({ error: 'Import session expired or invalid' }, { status: 400 });
+  }
+
+  const folders = await fetchDiscogsCollectionFolders();
+  const folderById = new Map(folders.map((folder) => [folder.id, folder]));
+  const defaultFolderId = folderById.has(1) ? 1 : folders[0]?.id ?? null;
+  const parsedSelections = parseAddSelections({
+    importId,
+    selections: [{
+      releaseId: Number(body.releaseId),
+      folderId: Number(body.folderId),
+      invoiceItemLabel: `${item.catalogNumber} — ${item.artist} — ${item.title}`,
+    }],
+  }, folderById, defaultFolderId);
+
+  if (parsedSelections.error) {
+    return NextResponse.json({ error: parsedSelections.error }, { status: 400 });
+  }
+
+  const addOutcome = await addSelectedReleasesToCollection(
+    parsedSelections.selections,
+    session.releaseIds,
+    session.metadata,
+    folderById,
+    importId,
+  );
+  const added = addOutcome.results.some((result) => result.status === 'added' || result.status === 'already-local');
+  if (added) {
+    removeOpenUnmatchedInvoiceItem(db, id);
+    if (item.invoiceNumber) {
+      markProcessedInvoiceLineAdded(db, {
+        invoiceNumber: item.invoiceNumber,
+        catalogNumber: item.catalogNumber,
+        artist: item.artist,
+        title: item.title,
+        discogsId: Number(body.releaseId),
+      });
+    }
+  }
+
+  return NextResponse.json({
+    success: addOutcome.results.every((result) => !['error', 'partial', 'rejected'].includes(result.status)),
+    removed: added,
+    results: addOutcome.results,
+  });
+}
+
+function rememberFinishedInvoice(
+  session: ImportSession,
+  selections: AddCollectionSelection[],
+  results: Array<{ releaseId: number; status: string }>,
+) {
+  if (!session.metadata.invoiceNumber || session.items.length === 0) {
+    return;
+  }
+
+  const selectedReleaseByItemId = new Map(
+    selections
+      .filter((selection) => selection.itemId)
+      .map((selection) => [selection.itemId as string, selection.releaseId]),
+  );
+  const classified = classifyInvoiceLines({
+    lines: session.items.map((item) => ({
+      catalogNumber: item.catalogNumber,
+      artist: item.artist,
+      title: item.title,
+      rawDescription: item.rawDescription,
+      matchStatus: session.matchOutcomes.get(item.id) ?? 'pending',
+      selectedReleaseId: selectedReleaseByItemId.get(item.id) ?? null,
+    })),
+    addResults: results,
+  });
+  if (!classified) {
+    return;
+  }
+
+  const db = getDatabase().getDb();
+  const existing = findProcessedInvoice(db, session.metadata.invoiceNumber);
+  completeProcessedInvoice(db, {
+    invoiceNumber: session.metadata.invoiceNumber,
+    invoiceDate: session.metadata.invoiceDate,
+    lines: existing
+      ? mergeProcessedInvoiceLines([...existing.added, ...existing.notAdded], classified)
+      : classified,
+  });
+}
+
+async function completeInvoiceWithNoMatches(request: NextRequest) {
+  const body = await request.json() as { importId?: unknown };
+  const importId = typeof body.importId === 'string' ? body.importId : '';
+  const session = getImportSession(importId);
+  if (!session?.metadata.invoiceNumber) {
+    return NextResponse.json({ error: 'Invoice number is required' }, { status: 400 });
+  }
+  if (session.items.length === 0 || session.matchOutcomes.size !== session.items.length) {
+    return NextResponse.json({ error: 'Invoice search is not finished' }, { status: 400 });
+  }
+  if (session.items.some((item) => session.matchOutcomes.get(item.id) !== 'no-match')) {
+    return NextResponse.json({ error: 'Invoice still has lines that were found or failed' }, { status: 400 });
+  }
+
+  const recorded = recordInvoiceWithNoMatches(getDatabase().getDb(), {
+    invoiceNumber: session.metadata.invoiceNumber,
+    invoiceDate: session.metadata.invoiceDate,
+    lines: session.items.map((item) => ({
+      catalogNumber: item.catalogNumber,
+      artist: item.artist,
+      title: item.title,
+      rawDescription: item.rawDescription,
+    })),
+  });
+  return NextResponse.json({ recorded });
 }
 
 export async function GET(request: NextRequest) {
@@ -1180,6 +1440,15 @@ export async function GET(request: NextRequest) {
   try {
     const { searchParams } = new URL(request.url);
     const action = searchParams.get('action');
+
+    if (action === 'unmatched') {
+      const db = getDatabase().getDb();
+      const items = listOpenUnmatchedInvoiceItems(db).map((item) => ({
+        ...item,
+        collectionMatch: findCollectionRelease(db, item.artist, item.title),
+      }));
+      return NextResponse.json({ items });
+    }
 
     if (action !== 'folders') {
       return NextResponse.json({ error: 'Unsupported invoice import action' }, { status: 400 });
@@ -1223,17 +1492,58 @@ export async function POST(request: NextRequest) {
         return NextResponse.json({ error: 'Invoice item is required' }, { status: 400 });
       }
 
-      const candidates = await findCandidates(item, debug ? debugTrace : undefined, session?.searchResults);
+      const match = await findCandidates(item, debug ? debugTrace : undefined, session?.searchResults);
+      const candidates = match.candidates;
       if (importId) {
         addCandidatesToImportSession(importId, candidates);
+      }
+
+      const outcome = match.allSearchesFailed ? 'error' : candidates.length > 0 ? 'matched' : 'no-match';
+      session?.matchOutcomes.set(item.id, outcome);
+
+      if (shouldRecordUnmatchedMiss({
+        candidateCount: candidates.length,
+        allSearchesFailed: match.allSearchesFailed,
+      })) {
+        try {
+          saveUnmatchedInvoiceLine(getDatabase().getDb(), {
+            catalogNumber: item.catalogNumber,
+            artist: item.artist,
+            title: item.title,
+            rawDescription: item.rawDescription || '',
+            unitPrice: Number.isFinite(item.unitPrice) ? item.unitPrice : null,
+            quantity: Number.isFinite(item.quantity) ? item.quantity : null,
+            invoiceNumber: session?.metadata.invoiceNumber ?? null,
+            invoiceDate: session?.metadata.invoiceDate ?? null,
+          });
+        } catch (saveError) {
+          console.error('Failed to save unmatched invoice line:', saveError);
+        }
       }
 
       return NextResponse.json({
         ...(debug ? { matcherVersion: MATCHER_VERSION } : {}),
         itemId: item.id,
         candidates,
+        searchFailed: match.allSearchesFailed,
         ...(debug ? { debugTrace } : {}),
       });
+    }
+
+    if (action === 'unmatched-dismiss') {
+      return dismissUnmatchedLine(request);
+    }
+
+    if (action === 'unmatched-search') {
+      return searchUnmatchedLine(request);
+    }
+
+    if (action === 'unmatched-add') {
+      return addUnmatchedLine(request);
+    }
+
+    if (action === 'invoice-complete') {
+      return completeInvoiceWithNoMatches(request);
     }
 
     if (action === 'add') {
@@ -1261,6 +1571,7 @@ export async function POST(request: NextRequest) {
         body.importId,
       );
       const results = addOutcome.results;
+      rememberFinishedInvoice(session, parsedSelections.selections, results);
 
       return NextResponse.json({
         success: results.every((result) => !['error', 'partial', 'rejected'].includes(result.status)),
@@ -1288,11 +1599,53 @@ export async function POST(request: NextRequest) {
     const invoice = parseDeejayInvoicePdf(buffer);
     const { extractedText, ...safeInvoice } = invoice;
     void extractedText;
+    const processed = invoice.invoiceNumber
+      ? compareUploadedInvoice(getDatabase().getDb(), {
+        invoiceNumber: invoice.invoiceNumber,
+        invoiceDate: invoice.invoiceDate,
+        items: invoice.items,
+      })
+      : null;
+    if (processed) {
+      const missingIdentities = new Set(
+        processed.notAdded
+          .filter((line) => line.outcome === 'missing')
+          .map((line) => unmatchedInvoiceIdentity(line)),
+      );
+      const gapItems = invoice.items.filter((item) => missingIdentities.has(unmatchedInvoiceIdentity(item)));
+      const gapIdentities = new Set(gapItems.map((item) => unmatchedInvoiceIdentity(item)));
+      const importId = gapItems.length > 0
+        ? createImportSession({
+          invoiceNumber: invoice.invoiceNumber,
+          invoiceDate: invoice.invoiceDate,
+          shippingPrice: invoice.shippingPrice,
+        }, gapItems)
+        : undefined;
+
+      return NextResponse.json({
+        ...safeInvoice,
+        alreadyProcessed: true,
+        added: processed.added,
+        notAdded: processed.notAdded.filter((line) => (
+          line.outcome !== 'missing' || !gapIdentities.has(unmatchedInvoiceIdentity(line))
+        )),
+        invoiceLineCount: processed.invoiceLineCount,
+        systemCount: processed.systemCount,
+        unaccountedCount: processed.unaccountedCount,
+        ...(importId ? { importId } : {}),
+        items: gapItems.map((item) => ({
+          ...item,
+          catalogVariants: generateCatalogVariants(item.catalogNumber),
+          candidates: [],
+        })),
+      });
+    }
+
     const importId = createImportSession({
       invoiceNumber: invoice.invoiceNumber,
       invoiceDate: invoice.invoiceDate,
       shippingPrice: invoice.shippingPrice,
-    });
+    }, invoice.items);
 
     return NextResponse.json({
       ...safeInvoice,

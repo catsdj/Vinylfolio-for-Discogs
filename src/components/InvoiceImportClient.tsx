@@ -6,7 +6,9 @@ import { AlertCircle, CheckCircle2, ExternalLink, FileText, PlusCircle, Search, 
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
 import { Select } from '@/components/ui/select';
+import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import SetupRequiredCard from '@/components/SetupRequiredCard';
+import UnmatchedInvoicePanel from '@/components/UnmatchedInvoicePanel';
 
 type SetupInfo = {
   configured: boolean;
@@ -49,11 +51,27 @@ interface InvoiceItem {
 
 interface InvoiceImportResult {
   vendor: 'deejay.de';
-  importId: string;
+  importId?: string;
   invoiceNumber: string | null;
   invoiceDate: string | null;
   currency: string | null;
   items: InvoiceItem[];
+  alreadyProcessed?: boolean;
+  added?: ProcessedInvoiceLine[];
+  notAdded?: ProcessedInvoiceLine[];
+  invoiceLineCount?: number;
+  systemCount?: number;
+  unaccountedCount?: number;
+}
+
+interface ProcessedInvoiceLine {
+  catalogNumber: string;
+  artist: string;
+  title: string;
+  rawDescription: string;
+  outcome: 'added' | 'not-found' | 'skipped' | 'dismissed' | 'add-failed' | 'search-failed' | 'missing';
+  discogsId: number | null;
+  releaseTitle: string | null;
 }
 
 interface AddCollectionResult {
@@ -75,7 +93,17 @@ interface AddSelection {
   releaseId: number;
   folderId: number;
   invoiceItemLabel: string;
+  itemId: string;
 }
+
+const notAddedOutcomeLabel: Record<Exclude<ProcessedInvoiceLine['outcome'], 'added'>, string> = {
+  'not-found': 'Not found on Discogs',
+  skipped: 'Left unselected',
+  dismissed: 'Dismissed',
+  'add-failed': 'Add failed',
+  'search-failed': 'Search failed',
+  missing: 'Not in the system',
+};
 
 const confidenceClassNames: Record<InvoiceCandidate['confidence'], string> = {
   strong: 'border-emerald-200 bg-emerald-50 text-emerald-800',
@@ -135,6 +163,7 @@ export default function InvoiceImportClient() {
           releaseId,
           folderId,
           invoiceItemLabel: `${item.catalogNumber} — ${item.artist} — ${item.title}`,
+          itemId: item.id,
         };
       })
       .filter((selection): selection is AddSelection => selection !== null);
@@ -256,8 +285,14 @@ export default function InvoiceImportClient() {
     setError(null);
   };
 
-  const matchInvoiceItems = async (items: InvoiceItem[], runId: number, importId: string) => {
+  const matchInvoiceItems = async (
+    items: InvoiceItem[],
+    runId: number,
+    importId: string,
+    invoiceMeta: { invoiceNumber: string | null; invoiceDate: string | null },
+  ) => {
     setIsMatching(true);
+    const outcomes = new Map<string, 'matched' | 'no-match' | 'error'>();
 
     for (const item of items) {
       if (importRunRef.current !== runId) {
@@ -287,7 +322,26 @@ export default function InvoiceImportClient() {
           throw new Error(payload.error || 'Discogs matching failed');
         }
 
+        if (payload.searchFailed) {
+          outcomes.set(item.id, 'error');
+          setResult((current) => current ? {
+            ...current,
+            items: current.items.map((currentItem) => (
+              currentItem.id === item.id
+                ? {
+                    ...currentItem,
+                    candidates: [],
+                    matchStatus: 'error',
+                    matchError: 'Discogs search failed. This invoice was not marked as finished.',
+                  }
+                : currentItem
+            )),
+          } : current);
+          continue;
+        }
+
         const candidates = payload.candidates as InvoiceCandidate[];
+        outcomes.set(item.id, candidates.length > 0 ? 'matched' : 'no-match');
         setResult((current) => current ? {
           ...current,
           items: current.items.map((currentItem) => (
@@ -306,6 +360,7 @@ export default function InvoiceImportClient() {
           setCandidateSelection(item.id, bestCandidate.id);
         }
       } catch (matchError) {
+        outcomes.set(item.id, 'error');
         setResult((current) => current ? {
           ...current,
           items: current.items.map((currentItem) => (
@@ -323,6 +378,14 @@ export default function InvoiceImportClient() {
 
     if (importRunRef.current === runId) {
       setIsMatching(false);
+      const everyLineMissed = items.length > 0 && items.every((item) => outcomes.get(item.id) === 'no-match');
+      if (everyLineMissed && invoiceMeta.invoiceNumber) {
+        await fetch('/api/invoices/deejay?action=invoice-complete', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ importId }),
+        });
+      }
     }
   };
 
@@ -354,6 +417,36 @@ export default function InvoiceImportClient() {
         throw new Error(payload.error || 'Invoice import failed');
       }
 
+      if (payload.alreadyProcessed) {
+        const gapItems = (payload.items as InvoiceItem[] | undefined || []).map((item) => ({
+          ...item,
+          candidates: [],
+          matchStatus: 'pending' as const,
+        }));
+        setResult({
+          vendor: payload.vendor,
+          importId: payload.importId,
+          invoiceNumber: payload.invoiceNumber,
+          invoiceDate: payload.invoiceDate,
+          currency: payload.currency,
+          items: gapItems,
+          alreadyProcessed: true,
+          added: payload.added || [],
+          notAdded: payload.notAdded || [],
+          invoiceLineCount: payload.invoiceLineCount,
+          systemCount: payload.systemCount,
+          unaccountedCount: payload.unaccountedCount,
+        });
+        setIsImporting(false);
+        if (gapItems.length > 0 && payload.importId) {
+          void matchInvoiceItems(gapItems, runId, payload.importId as string, {
+            invoiceNumber: payload.invoiceNumber ?? null,
+            invoiceDate: payload.invoiceDate ?? null,
+          });
+        }
+        return;
+      }
+
       const parsedItems = (payload.items as InvoiceItem[]).map((item) => ({
         ...item,
         candidates: [],
@@ -365,7 +458,10 @@ export default function InvoiceImportClient() {
         items: parsedItems,
       });
       setIsImporting(false);
-      void matchInvoiceItems(parsedItems, runId, payload.importId as string);
+      void matchInvoiceItems(parsedItems, runId, payload.importId as string, {
+        invoiceNumber: payload.invoiceNumber ?? null,
+        invoiceDate: payload.invoiceDate ?? null,
+      });
     } catch (importError) {
       setError(importError instanceof Error ? importError.message : 'Invoice import failed');
       setIsMatching(false);
@@ -444,6 +540,12 @@ export default function InvoiceImportClient() {
 
       {setupStatus && !setupStatus.configured && <SetupRequiredCard setup={setupStatus} />}
 
+      <Tabs defaultValue="import" className="space-y-5">
+        <TabsList>
+          <TabsTrigger value="import" data-testid="invoice-tab-import">Import</TabsTrigger>
+          <TabsTrigger value="not-found" data-testid="invoice-tab-not-found">Not found during past imports</TabsTrigger>
+        </TabsList>
+        <TabsContent value="import" className="space-y-5">
       <Card className="rounded-lg">
         <CardHeader>
           <CardTitle className="flex items-center gap-2">
@@ -516,10 +618,16 @@ export default function InvoiceImportClient() {
                   <div className="font-semibold">{result.invoiceDate || 'Unknown'}</div>
                 </div>
                 <div className="rounded-md bg-muted p-3">
-                  <div className="text-muted-foreground">Selected</div>
-                  <div className="font-semibold">{selectedCount} of {result.items.length}</div>
+                  <div className="text-muted-foreground">{result.alreadyProcessed && result.items.length === 0 ? 'Status' : 'Selected'}</div>
+                  <div className="font-semibold">
+                    {result.alreadyProcessed && result.items.length === 0
+                      ? 'Already processed'
+                      : `${selectedCount} of ${result.items.length}`}
+                  </div>
                 </div>
               </div>
+              {(!result.alreadyProcessed || result.items.length > 0) && (
+              <>
               <div className="mt-4 flex flex-col gap-3 border-t pt-4 sm:flex-row sm:items-center sm:justify-between">
                 <div className="text-sm text-muted-foreground">
                   {isAddingToCollection
@@ -591,9 +699,85 @@ export default function InvoiceImportClient() {
                   {addMessage}
                 </div>
               )}
+              </>
+              )}
             </CardContent>
           </Card>
 
+          {result.alreadyProcessed ? (
+            <div className="space-y-4" data-testid="invoice-already-processed">
+              <div className="rounded-md border border-amber-200 bg-amber-50 p-3 text-sm text-amber-900" data-testid="invoice-line-counts">
+                This invoice has {result.invoiceLineCount ?? 0} lines. The system has {result.systemCount ?? 0} records for it.
+                {(result.unaccountedCount ?? 0) > 0 ? (
+                  <div>
+                    {result.unaccountedCount} {result.unaccountedCount === 1 ? 'line is' : 'lines are'} on the invoice and not in the system.
+                    {result.items.length > 0
+                      ? ' Discogs is being searched for those lines. A line Discogs does not have is saved for the next upload.'
+                      : (result.notAdded || []).every((line) => line.outcome !== 'missing')
+                        ? ' Those lines could not be named, because releases added from older invoices do not store a catalog number.'
+                        : ''}
+                  </div>
+                ) : (
+                  <div>Discogs was not searched again.</div>
+                )}
+              </div>
+              <div className="grid gap-4 lg:grid-cols-2">
+                <Card className="rounded-lg">
+                  <CardHeader>
+                    <CardTitle>Added</CardTitle>
+                    <CardDescription>
+                      {(result.added || []).length === 0
+                        ? 'Nothing from this invoice was added.'
+                        : `${result.added?.length} added from this invoice.`}
+                    </CardDescription>
+                  </CardHeader>
+                  <CardContent className="space-y-3">
+                    {(result.added || []).map((line) => (
+                      <div key={`${line.discogsId ?? 'none'}-${line.catalogNumber}-${line.title}`} className="text-sm">
+                        <div className="font-medium">
+                          {[line.catalogNumber, line.artist, line.releaseTitle || line.title].filter(Boolean).join(' — ')}
+                        </div>
+                        {line.discogsId && (
+                          <a
+                            href={`https://www.discogs.com/release/${line.discogsId}`}
+                            target="_blank"
+                            rel="noreferrer"
+                            className="inline-flex items-center gap-1 text-blue-700 hover:underline"
+                          >
+                            Open Discogs
+                            <ExternalLink className="h-3 w-3" />
+                          </a>
+                        )}
+                      </div>
+                    ))}
+                  </CardContent>
+                </Card>
+                <Card className="rounded-lg">
+                  <CardHeader>
+                    <CardTitle>Not added</CardTitle>
+                    <CardDescription>
+                      {(result.notAdded || []).length === 0
+                        ? 'Every remembered line was added.'
+                        : `${result.notAdded?.length} not added from this invoice.`}
+                    </CardDescription>
+                  </CardHeader>
+                  <CardContent className="space-y-3">
+                    {(result.notAdded || []).map((line) => (
+                      <div key={`${line.outcome}-${line.catalogNumber}-${line.title}`} className="text-sm">
+                        <div className="font-medium">
+                          {[line.catalogNumber, line.artist, line.title].filter(Boolean).join(' — ')}
+                        </div>
+                        <div className="text-muted-foreground">
+                          {line.outcome === 'added' ? '' : notAddedOutcomeLabel[line.outcome]}
+                        </div>
+                      </div>
+                    ))}
+                  </CardContent>
+                </Card>
+              </div>
+            </div>
+          ) : null}
+          {result.items.length > 0 && (
           <div className="space-y-4">
             {result.items.map((item, itemIndex) => (
               <Card key={item.id} className="rounded-lg">
@@ -642,7 +826,7 @@ export default function InvoiceImportClient() {
                     </div>
                   ) : item.candidates.length === 0 ? (
                     <div className="rounded-md border border-amber-200 bg-amber-50 p-3 text-sm text-amber-800">
-                      No candidates found. This row will need manual search in the next iteration.
+                      No candidates found. This line is saved under Not found during past imports.
                     </div>
                   ) : (
                     <div className="grid gap-3">
@@ -789,8 +973,19 @@ export default function InvoiceImportClient() {
               </Card>
             ))}
           </div>
+          )}
         </>
       )}
+        </TabsContent>
+        <TabsContent value="not-found">
+          <UnmatchedInvoicePanel
+            collectionFolders={collectionFolders}
+            isLoadingFolders={isLoadingFolders}
+            folderError={folderError}
+            defaultFolderId={defaultFolderId}
+          />
+        </TabsContent>
+      </Tabs>
     </div>
   );
 }
