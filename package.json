@@ -4,7 +4,7 @@
   "description": "VinylFolio — a local-first vinyl collection manager for Discogs.",
   "repository": {
     "type": "git",
-    "url": "https://github.com/catsdj/Discogs-collection-manager.git"
+    "url": "https://github.com/catsdj/Discogs-local-collection-manager.git"
   },
   "main": "index.js",
   "scripts": {

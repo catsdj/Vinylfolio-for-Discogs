@@ -92,11 +92,11 @@ Choose a folder where you want to keep the app, then open a terminal in that fol
 cd "<folder where you keep projects>"
 ```
 
-Clone the repository from that terminal. This creates a new `Discogs-local-collection-manager` folder inside the folder you chose. Then enter the new app folder:
+Clone the repository from that terminal into a `VinylFolio` folder. Then enter the new app folder:
 
 ```bash
-git clone https://github.com/catsdj/Discogs-local-collection-manager.git
-cd Discogs-local-collection-manager
+git clone https://github.com/catsdj/Discogs-local-collection-manager.git VinylFolio
+cd VinylFolio
 ```
 
 Alternatively, download and extract the repository ZIP from GitHub, then open a terminal in the extracted folder.
