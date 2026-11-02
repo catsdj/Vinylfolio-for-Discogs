@@ -21,6 +21,7 @@ import { isValidDiscogsUrl, isValidYouTubeUrl } from '@/lib/clientSecurity';
 import { YouTubePlaylistEmbed } from '@/components/YouTubePlaylistEmbed';
 import { YouTubeVideoEmbed } from '@/components/YouTubeVideoEmbed';
 import { extractYouTubePlaylistId, extractYouTubeVideoId } from '@/lib/urlValidation';
+import { buildYouTubeEmbedUrl, formatYouTubeDuration } from '@/lib/youtubeEmbed';
 import { FileText, ListMusic, Search, TrendingUp, X } from 'lucide-react';
 import { toast } from 'sonner';
 import { usePlaylists } from '@/hooks/usePlaylists';
@@ -1128,18 +1129,25 @@ export default function DiscogsCollection() {
 
   // Function to create a release playlist from individual videos
   const createReleasePlaylist = (videos: Array<{ uri: string; title: string; description: string; duration: number; embed: boolean }>, releaseTitle: string) => {
-    if (videos.length < 2) return null; // Only create playlist if there are multiple videos
+    if (videos.length < 1) return null;
     
     // Extract video IDs
-    const videoIds = videos.map(video => extractYouTubeVideoId(video.uri)).filter(id => id !== null);
+    const seenVideoIds = new Set<string>();
+    const playableVideos = videos.filter(video => {
+      const videoId = extractYouTubeVideoId(video.uri);
+      if (!videoId || seenVideoIds.has(videoId)) return false;
+      seenVideoIds.add(videoId);
+      return true;
+    });
+    const videoIds = playableVideos.map(video => extractYouTubeVideoId(video.uri)).filter(id => id !== null);
     
-    if (videoIds.length < 2) return null; // Need at least 2 videos for a playlist
+    if (videoIds.length < 1) return null;
     
     return {
-      videos: videos,
+      videos: playableVideos,
       videoIds: videoIds,
       title: `${releaseTitle} - Complete Playlist`,
-      totalVideos: videos.length
+      totalVideos: playableVideos.length
     };
   };
 
@@ -1489,19 +1497,19 @@ export default function DiscogsCollection() {
                 const hasReleasePlaylist = releasePlaylist && !release.youtubePlaylistId && !release.discogsVideos;
                 const hasYouTubeVideo = release.youtubeVideoId && !release.youtubePlaylistId && !releasePlaylist && !release.discogsVideos;
                 const hasApiPlaylists = playlists.length > 0;
-                const hasIndividualVideos = individualVideos.length > 0;
-
-                if (hasDiscogsVideos || hasYouTubePlaylist || hasReleasePlaylist || hasYouTubeVideo || hasApiPlaylists || hasIndividualVideos) {
-                  // Count total videos for scrolling
-                  const totalVideos = (release.discogsVideos?.length || 0) + 
-                                    (releasePlaylist?.videos.length || 0) + 
-                                    (hasYouTubePlaylist ? 1 : 0) + 
-                                    (hasYouTubeVideo ? 1 : 0) + 
-                                    playlists.length + 
-                                    individualVideos.length;
+                if (hasDiscogsVideos || hasYouTubePlaylist || hasReleasePlaylist || hasYouTubeVideo || hasApiPlaylists) {
+                  // Count only videos rendered by the embedded player/list.
+                  const totalVideos = releasePlaylist?.videos.length || release.discogsVideos?.length ||
+                    (hasYouTubePlaylist ? 1 : 0) +
+                    (hasYouTubeVideo ? 1 : 0) +
+                    playlists.length;
 
                   return (
-                    <div className="space-y-1 bg-gray-50 p-2 rounded border max-h-48 overflow-y-auto">
+                    <details className="bg-gray-50 rounded border">
+                      <summary className="cursor-pointer select-none px-3 py-2 text-sm font-semibold text-gray-800">
+                        Videos ({totalVideos})
+                      </summary>
+                      <div className="space-y-3 p-2 border-t">
                       {/* Discogs Videos */}
                       {hasDiscogsVideos && release.discogsVideos && (
                         <div className="space-y-1">
@@ -1536,25 +1544,14 @@ export default function DiscogsCollection() {
                         </div>
                       )}
                       
-                      {/* Release Playlist */}
                       {hasReleasePlaylist && releasePlaylist && (
-                        <div className="space-y-1">
-                          <div className="text-xs font-medium text-gray-700">Release Videos:</div>
-                          {releasePlaylist.videos.map((video, index) => (
-                            <a
-                              key={index}
-                              href={video.uri}
-                              target="_blank"
-                              rel="noopener noreferrer"
-                              className="text-blue-600 hover:text-blue-800 hover:underline text-sm block truncate"
-                              title={video.title}
-                            >
-                              🎵 {video.title.length > 70 ? video.title.substring(0, 70) + '...' : video.title}
-                            </a>
-                          ))}
-                        </div>
+                        <ReleasePlaylistComponent
+                          playlist={releasePlaylist}
+                          releaseTitle={release.basic_information.title}
+                          isCardView
+                        />
                       )}
-                      
+
                       {/* Single YouTube Video */}
                       {hasYouTubeVideo && release.youtubeVideoId && (
                         <div className="space-y-1">
@@ -1585,20 +1582,8 @@ export default function DiscogsCollection() {
                         </div>
                       ))}
                       
-                      {/* Individual Videos */}
-                      {hasIndividualVideos && individualVideos.map((video, index) => (
-                        <a
-                          key={index}
-                          href={video.uri}
-                          target="_blank"
-                          rel="noopener noreferrer"
-                          className="text-blue-600 hover:text-blue-800 hover:underline text-sm block truncate"
-                          title={video.title}
-                        >
-                          🎵 {video.title.length > 70 ? video.title.substring(0, 70) + '...' : video.title}
-                        </a>
-                      ))}
-                    </div>
+                      </div>
+                    </details>
                   );
                 } else {
                   return (
@@ -1616,44 +1601,60 @@ export default function DiscogsCollection() {
   };
 
   // Release Playlist Component - Shows all videos from a release
-  const ReleasePlaylistComponent = ({ playlist, releaseTitle, isCardView = false }: { playlist: { videos: Array<{ uri: string; title: string; description: string; duration: number; embed: boolean }>; videoIds: string[]; title: string; totalVideos: number }; releaseTitle: string; isCardView?: boolean }) => (
-    <div className="space-y-2">
-      {/* Show first video as embedded player */}
-      {playlist.videoIds.length > 0 && (
-        <iframe
-          width={isCardView ? "100%" : "640"}
-          height={isCardView ? "200" : "360"}
-          src={`https://www.youtube.com/embed/${playlist.videoIds[0]}?playlist=${playlist.videoIds.slice(1).join(',')}`}
-          title={playlist.title}
-          frameBorder="0"
-          allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture"
-          allowFullScreen
-          className="rounded border w-full"
-        ></iframe>
-      )}
-      
-      {/* Show playlist content - all tracks (hidden in card view) */}
-      {!isCardView && (
-        <div className="space-y-1 max-h-40 overflow-y-auto bg-gray-50 p-2 rounded border">
-          <div className="text-xs font-medium text-gray-700 mb-2">Playlist Content:</div>
+  const ReleasePlaylistComponent = ({ playlist, releaseTitle, isCardView = false }: { playlist: { videos: Array<{ uri: string; title: string; description: string; duration: number; embed: boolean }>; videoIds: string[]; title: string; totalVideos: number }; releaseTitle: string; isCardView?: boolean }) => {
+    const [currentIndex, setCurrentIndex] = useState(0);
+    const [autoplay, setAutoplay] = useState(false);
+    const currentVideoId = playlist.videoIds[currentIndex];
+    const embedUrl = buildYouTubeEmbedUrl(
+      currentVideoId ? [currentVideoId] : [],
+      null,
+      autoplay
+    );
+
+    return (
+      <div className="space-y-2">
+        {embedUrl && (
+          <iframe
+            width={isCardView ? "100%" : "640"}
+            height={isCardView ? "200" : "360"}
+            src={embedUrl}
+            title={`${releaseTitle} videos`}
+            frameBorder="0"
+            allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture"
+            allowFullScreen
+            className="rounded border w-full"
+          />
+        )}
+
+        <div className="max-h-36 overflow-y-auto bg-white rounded border divide-y">
           {playlist.videos.map((video, index) => (
-            <div key={index} className="flex items-center gap-2 text-xs">
-              <span className="text-gray-500 font-mono w-6">{index + 1}.</span>
-              <a
-                href={video.uri}
-                target="_blank"
-                rel="noopener noreferrer"
-                className="text-blue-600 hover:text-blue-800 hover:underline flex-1"
-                title={video.title}
-              >
-                {video.title.length > 50 ? video.title.substring(0, 50) + '...' : video.title}
-              </a>
-            </div>
+            <button
+              key={`${playlist.videoIds[index] || video.uri}-${index}`}
+              type="button"
+              onClick={() => {
+                setCurrentIndex(index);
+                setAutoplay(true);
+              }}
+              className={`w-full flex items-center gap-2 p-2 text-left ${currentIndex === index ? 'bg-blue-50' : 'hover:bg-gray-50'}`}
+            >
+              {playlist.videoIds[index] && (
+                <img
+                  src={`https://i.ytimg.com/vi/${playlist.videoIds[index]}/default.jpg`}
+                  alt=""
+                  width="64"
+                  height="40"
+                  loading="lazy"
+                  className="h-10 w-16 object-cover rounded"
+                />
+              )}
+              <span className="min-w-0 flex-1 text-xs text-blue-700 truncate">{video.title}</span>
+              {video.duration > 0 && <span className="text-[11px] text-gray-500">{formatYouTubeDuration(video.duration)}</span>}
+            </button>
           ))}
         </div>
-      )}
-    </div>
-  );
+      </div>
+    );
+  };
 
   // Job status component
   const JobStatusDisplay = () => {
@@ -2752,6 +2753,24 @@ export default function DiscogsCollection() {
                                   const hasYouTubePlaylist = release.youtubePlaylistId && !release.discogsVideos;
                                   const hasReleasePlaylist = videos.length > 0 && !release.youtubePlaylistId && !release.discogsVideos;
                                   const hasYouTubeVideo = release.youtubeVideoId && !release.youtubePlaylistId && !hasReleasePlaylist && !release.discogsVideos;
+
+                                   const releasePlaylist = createReleasePlaylist(videos, release.basic_information.title);
+                                   if (releasePlaylist) {
+                                     return (
+                                       <details className="bg-gray-50 rounded border">
+                                         <summary className="cursor-pointer select-none px-2 py-1 text-sm font-semibold text-gray-800">
+                                           Videos ({releasePlaylist.videos.length})
+                                         </summary>
+                                         <div className="p-2 border-t">
+                                           <ReleasePlaylistComponent
+                                             playlist={releasePlaylist}
+                                             releaseTitle={release.basic_information.title}
+                                             isCardView
+                                           />
+                                         </div>
+                                       </details>
+                                     );
+                                   }
 
                                   if (hasDiscogsVideos || hasYouTubePlaylist || hasReleasePlaylist || hasYouTubeVideo) {
                                     // Count total videos for scrolling
