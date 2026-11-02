@@ -14,8 +14,8 @@ const geistMono = Geist_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "Discogs Collection Manager",
-  description: "Manage and browse your Discogs vinyl collection",
+  title: "VinylFolio",
+  description: "Manage and browse your vinyl collection with Discogs",
 };
 
 export default function RootLayout({

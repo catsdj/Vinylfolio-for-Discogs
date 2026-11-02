@@ -6,7 +6,7 @@ export default function Home() {
     <div className="min-h-screen bg-muted/30 p-4">
       <div className="mx-auto max-w-[calc(100vw-40px)] px-2 sm:px-4">
         <header className="text-center mb-8">
-          <h1 className="text-4xl font-bold mb-2">Discogs Collection Manager</h1>
+          <h1 className="text-4xl font-bold mb-2">VinylFolio</h1>
           <p className="text-lg text-muted-foreground">
             Browse and filter your vinyl collection the way Discogs can&apos;t
           </p>

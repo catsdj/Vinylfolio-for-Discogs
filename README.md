@@ -1,6 +1,6 @@
-# Discogs Collection Manager
+# VinylFolio
 
-Discogs Collection Manager is a Next.js application for managing a vinyl collection locally using the Discogs API, a local SQLite database, and a UI optimized for browsing, filtering, syncing, and enrichment workflows.
+VinylFolio is a Next.js application for managing a vinyl collection locally using the Discogs API, a local SQLite database, and a UI optimized for browsing, filtering, syncing, and enrichment workflows.
 
 This is WIP. Bugs and inconsistencies may be present :)
 

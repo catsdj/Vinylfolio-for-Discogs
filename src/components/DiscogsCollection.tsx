@@ -18,6 +18,7 @@ import TagPicker from '@/components/TagPicker';
 import FilterDropdown, { FilterDropdownRef } from '@/components/FilterDropdown';
 import { clearCache, getCacheStats } from '@/lib/cache';
 import { isValidDiscogsUrl, isValidYouTubeUrl } from '@/lib/clientSecurity';
+import DiscogsAttribution from '@/components/DiscogsAttribution';
 import { YouTubePlaylistEmbed } from '@/components/YouTubePlaylistEmbed';
 import { YouTubeVideoEmbed } from '@/components/YouTubeVideoEmbed';
 import { extractYouTubePlaylistId, extractYouTubeVideoId } from '@/lib/urlValidation';
@@ -1594,6 +1595,7 @@ export default function DiscogsCollection() {
                 }
               })()}
             </div>
+            <DiscogsAttribution href={getDiscogsUrl(release)} className="block pt-1" />
           </div>
         </CardContent>
       </Card>
@@ -2694,6 +2696,7 @@ export default function DiscogsCollection() {
                                     {addLineBreaks(release.basic_information.title)}
                                   </div>
                                 </a>
+                                <DiscogsAttribution href={getDiscogsUrl(release)} className="mt-1 block" />
                               </TableCell>
                               <TableCell className="whitespace-nowrap">
                                 {release.basic_information.year === 0 ? '-' : release.basic_information.year}

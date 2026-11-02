@@ -1,7 +1,7 @@
 {
-  "name": "discogs",
+  "name": "vinylfolio",
   "version": "1.0.0",
-  "description": "Discogs Collection Manager — Next.js app to browse, filter, and sync your vinyl collection.",
+  "description": "VinylFolio — a local-first vinyl collection manager for Discogs.",
   "repository": {
     "type": "git",
     "url": "https://github.com/catsdj/Discogs-collection-manager.git"
