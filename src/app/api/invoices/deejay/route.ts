@@ -1033,10 +1033,10 @@ function parseAddSelections(
   folderById: Map<number, DiscogsCollectionFolder>,
   defaultFolderId: number | null,
 ): { selections: AddCollectionSelection[]; error?: string } {
-  const rawSelections = Array.isArray(body.selections)
+  const rawSelections: AddCollectionSelection[] | null = Array.isArray(body.selections)
     ? body.selections
     : Array.isArray(body.releaseIds)
-      ? body.releaseIds.map((releaseId) => ({ releaseId, folderId: defaultFolderId, invoiceItemLabel: undefined }))
+      ? body.releaseIds.map((releaseId) => ({ releaseId, folderId: defaultFolderId as number, invoiceItemLabel: undefined }))
       : null;
 
   if (!rawSelections) {

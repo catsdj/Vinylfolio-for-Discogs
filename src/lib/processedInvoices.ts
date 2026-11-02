@@ -57,6 +57,12 @@ interface InvoiceIdentityLine {
   rawDescription: string;
 }
 
+type KnownInvoiceLine = InvoiceIdentityLine & {
+  outcome: ProcessedLineOutcome;
+  discogsId: number | null;
+  releaseTitle: string | null;
+};
+
 export interface InvoiceLineForClassification {
   catalogNumber: string;
   artist: string;
@@ -341,11 +347,7 @@ function toComparisonLine(
 export function reconcileInvoiceLines(input: {
   invoiceLines: InvoiceIdentityLine[];
   addedReleases: Array<{ discogsId: number; artist: string; title: string }>;
-  knownLines: Array<InvoiceIdentityLine & {
-    outcome: ProcessedLineOutcome;
-    discogsId: number | null;
-    releaseTitle: string | null;
-  }>;
+  knownLines: KnownInvoiceLine[];
 }): InvoiceLineCounts {
   const knownNotAdded = input.knownLines.filter((line) => line.outcome !== 'added');
   const knownByIdentity = new Map(knownNotAdded.map((line) => [unmatchedInvoiceIdentity(line), line]));
@@ -464,10 +466,10 @@ function loadAddedReleases(db: Database.Database, invoiceNumber: string): Array<
   }));
 }
 
-function loadKnownLines(db: Database.Database, invoiceNumber: string): InvoiceLineCounts['notAdded'] {
-  const lines: InvoiceLineCounts['notAdded'] = [];
+function loadKnownLines(db: Database.Database, invoiceNumber: string): KnownInvoiceLine[] {
+  const lines: KnownInvoiceLine[] = [];
   const seen = new Set<string>();
-  const push = (line: InvoiceLineCounts['notAdded'][number]) => {
+  const push = (line: KnownInvoiceLine) => {
     if (line.outcome === 'added') {
       return;
     }
